@@ -1,0 +1,379 @@
+#!/bin/sh
+set -eu
+
+DB=/var/lib/box
+MAN="$DB/manifests"
+META="$DB/meta"
+LOGS="$DB/logs"
+STATE="$DB/state"
+
+die(){ echo "box: $*" >&2; exit 1; }
+
+need_root() {
+  [ "$(id -u)" -eq 0 ] || die "run as root (or via sudo)."
+}
+
+usage() {
+  cat <<USAGE
+box - ls-box package tool
+
+Usage:
+  box init
+  box add <recipe> [--force]
+  box rm <name-ver>
+  box own <absolute-path>
+  box list
+  box info <name-ver>
+  box world <listfile> [--force]
+  box adopt <name> <ver> <absolute-path> [--src <path>] [--desc <text>]
+
+Recipe conventions:
+  A recipe is a shell file that defines:
+    PKG=name
+    VER=version
+    SRC=/sources/pkg-ver.tar.xz   (optional)
+    configure() { ... }           (optional)
+    build() { ... }               (optional)
+    pkg_install() { ... }         (required; must install into "\$DESTDIR")
+USAGE
+}
+
+box_init() {
+  need_root
+  command install -d "$DB" "$MAN" "$META" "$LOGS" "$STATE"
+  echo "box: ok: initialized $DB"
+}
+
+load_recipe() {
+  RECIPE="$1"
+  [ -f "$RECIPE" ] || die "recipe not found: $RECIPE"
+  # shellcheck disable=SC1090
+  . "$RECIPE"
+  : "${PKG:?recipe must set PKG=...}"
+  : "${VER:?recipe must set VER=...}"
+  type pkg_install >/dev/null 2>&1 || die "recipe must define pkg_install() { ... }"
+  PKGID="${PKG}-${VER}"
+}
+
+stage_dir() {
+  DESTDIR="/tmp/box-stage/$PKGID"
+  rm -rf "$DESTDIR"
+  command install -d "$DESTDIR"
+}
+
+write_meta() {
+  ts="$(date -Is 2>/dev/null || date)"
+  meta_file="$META/$PKGID.meta"
+  {
+    echo "PKG=$PKG"
+    echo "VER=$VER"
+    echo "PKGID=$PKGID"
+    echo "DATE=$ts"
+    [ "${SRC:-}" ] && echo "SRC=$SRC"
+    [ "${DESC:-}" ] && echo "DESC=$DESC"
+  } > "$meta_file"
+}
+
+make_manifest() {
+  mf="$MAN/$PKGID.files"
+  (
+    cd "$DESTDIR"
+    find . -mindepth 1 \
+      ! -path './usr/share/info/dir' \
+      -print | sort
+  ) > "$mf"
+}
+
+check_collisions() {
+  force="${1:-no}"
+  mf="$MAN/$PKGID.files"
+  collisions="/tmp/box-collisions.$PKGID.$$"
+  : > "$collisions"
+
+  # For each staged path, check if it would overwrite something on /
+  while IFS= read -r p; do
+    # strip leading ./
+    rel="${p#./}"
+    [ -n "$rel" ] || continue
+    target="/$rel"
+
+  case "$target" in
+    /usr/share/info/dir)
+      continue
+      ;;
+  esac
+
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      # allow if target is a directory and we're also a directory
+      if [ -d "$target" ] && [ -d "$DESTDIR/$rel" ]; then
+        continue
+      fi
+      echo "$target" >> "$collisions"
+    fi
+  done < "$mf"
+
+  if [ -s "$collisions" ] && [ "$force" != "yes" ]; then
+    echo "box: collisions detected; refusing to overwrite." >&2
+    echo "box: re-run with --force to allow overwrites." >&2
+    echo "---- collisions ----" >&2
+    cat "$collisions" >&2
+    rm -f "$collisions"
+    exit 1
+  fi
+  rm -f "$collisions"
+}
+
+commit_stage() {
+  # Copy staged tree into /
+  ( cd "$DESTDIR" && tar cf - . ) | ( cd / && tar xpf - )
+}
+
+box_add() {
+  need_root
+  [ $# -ge 1 ] || die "usage: box add <recipe> [--force]"
+  force=no
+  [ "${2-}" = "--force" ] && force=yes
+
+  load_recipe "$1"                 # sources recipe
+  : "${PKG:?}" "${VER:?}" "${SRC:?}"
+  PKGID="$PKG-$VER"
+
+  stage_dir                         # sets DESTDIR
+
+  command install -d "$LOGS"
+  LOG="$LOGS/$PKGID.$(date +%Y%m%d-%H%M%S).log"
+  : >"$LOG"                         # ensure file exists even if we die next
+
+  run_step() {
+    step="$1"
+    type "$step" >/dev/null 2>&1 || die "recipe missing $step()"
+    (
+      set -euo pipefail
+      "$step"
+    ) 2>&1 | tee -a "$LOG"
+  }
+
+  run_step build
+  run_step pkg_install
+
+  make_manifest
+  check_collisions "$force"
+  commit_stage
+  write_meta
+
+  echo "box: ok: installed $PKGID"
+}
+
+box_rm() {
+  need_root
+  [ $# -eq 1 ] || die "rm requires <name-ver>"
+  PKGID="$1"
+  mf="$MAN/$PKGID.files"
+  [ -f "$mf" ] || die "manifest not found: $mf"
+
+  # Remove files/symlinks first
+  while IFS= read -r p; do
+    rel="${p#./}"
+    [ -n "$rel" ] || continue
+    target="/$rel"
+    case "$target" in
+      /|""|"/."|"/.."|*/../*|*/..|*/./*|*/.|*/..)
+        die "invalid or dangerous path in manifest: $target"
+        ;;
+    esac
+    case "$target" in
+      /usr/share/info/dir) continue ;;
+    esac
+
+    if [ -L "$target" ] || [ -f "$target" ]; then
+      rm -f "$target"
+    fi
+  done < "$mf"
+
+  # Then remove empty directories, deepest-first
+  # (manifest includes dirs too because find prints them)
+
+  if command -v tac >/dev/null 2>&1; then
+    TAC="tac"
+  else
+    die "tac not found (coreutils). Install it or provide a reverse-order tool."
+  fi
+
+  $TAC "$mf" | while IFS= read -r p; do
+    rel="${p#./}"
+    [ -n "$rel" ] || continue
+    target="/$rel"
+    case "$target" in
+      /|""|"/."|"/.."|*/../*|*/..|*/./*|*/.|*/..)
+        die "invalid or dangerous path in manifest: $target"
+        ;;
+    esac
+
+    case "$target" in
+      /usr/share/info/dir) continue ;;
+    esac
+
+    if [ -d "$target" ]; then
+      rmdir "$target" 2>/dev/null || true
+    fi
+  done
+
+  rm -f "$mf" "$META/$PKGID.meta"
+  echo "box: ok: removed $PKGID"
+}
+
+box_adopt() {
+  need_root
+  [ $# -ge 3 ] || die "usage: box adopt <name> <ver> <absolute-path> [--src <path>] [--desc <text>]"
+  PKG="$1"; VER="$2"; path="$3"; shift 3
+  PKGID="${PKG}-${VER}"
+
+  case "$path" in
+    /*) ;;
+    *) die "path must be absolute: $path" ;;
+  esac
+  [ -e "$path" ] || die "path not found: $path"
+
+  # parse optional flags
+  SRC=""
+  DESC=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --src)
+        [ $# -ge 2 ] || die "--src requires a value"
+        SRC="$2"; shift 2
+        ;;
+      --desc)
+        [ $# -ge 2 ] || die "--desc requires a value"
+        DESC="$2"; shift 2
+        ;;
+      *)
+        die "unknown option for adopt: $1"
+        ;;
+    esac
+  done
+
+  # refuse if already adopted/installed
+  [ ! -f "$MAN/$PKGID.files" ] || die "manifest already exists: $MAN/$PKGID.files"
+  [ ! -f "$META/$PKGID.meta" ] || die "meta already exists: $META/$PKGID.meta"
+
+  # refuse if some other package already "owns" this path
+  if box own "$path" >/dev/null 2>&1; then
+    owner="$(box own "$path" || true)"
+    die "path is already owned by: $owner"
+  fi
+
+  # Write manifest: include parent dirs + the path itself, all as ./-prefixed relpaths
+  mf="$MAN/$PKGID.files"
+  tmp="/tmp/box-adopt.$PKGID.$$"
+  : > "$tmp"
+
+  rel="${path#/}"   # drop leading /
+  # add parent directories, stopping before empty
+  d="$rel"
+  while :; do
+    d="$(dirname "$d")"
+    [ "$d" = "." ] && break
+    echo "./$d" >> "$tmp"
+  done
+
+  # add the exact path entry
+  echo "./$rel" >> "$tmp"
+
+  # de-dupe and sort like other manifests
+  LC_ALL=C sort -u "$tmp" > "$mf"
+  rm -f "$tmp"
+
+  # Write meta (reusing same format)
+  ts="$(date -Is 2>/dev/null || date)"
+  meta_file="$META/$PKGID.meta"
+  {
+    echo "PKG=$PKG"
+    echo "VER=$VER"
+    echo "PKGID=$PKGID"
+    echo "DATE=$ts"
+    [ -n "$SRC" ] && echo "SRC=$SRC"
+    [ -n "$DESC" ] && echo "DESC=$DESC"
+  } > "$meta_file"
+
+  echo "box: ok: adopted $PKGID ($path)"
+}
+
+box_own() {
+  [ $# -eq 1 ] || die "own requires an absolute path"
+  path="$1"
+  case "$path" in
+    /*) ;;
+    *) die "path must be absolute: $path" ;;
+  esac
+
+  found="no"
+  for mf in "$MAN"/*.files; do
+    [ -f "$mf" ] || continue
+    # match either file or directory exact path
+    if grep -qx "./${path#/}" "$mf"; then
+      echo "$(basename "$mf" .files)"
+      found="yes"
+    fi
+  done
+  [ "$found" = "yes" ] || exit 1
+}
+
+box_list() {
+  ls "$META" 2>/dev/null | sed 's/\.meta$//' | sort
+}
+
+box_info() {
+  [ $# -eq 1 ] || die "info requires <name-ver>"
+  f="$META/$1.meta"
+  [ -f "$f" ] || die "meta not found: $f"
+  cat "$f"
+}
+
+box_world() {
+  need_root
+  [ $# -ge 1 ] || die "world requires a list file"
+  list="$1"
+  force="no"
+  if [ "${2:-}" = "--force" ]; then force="yes"; fi
+  [ -f "$list" ] || die "list not found: $list"
+
+  runid="world-$(date +%Y%m%d-%H%M%S 2>/dev/null || date)"
+  out="$STATE/$runid.log"
+
+  {
+    echo "== box world =="
+    echo "LIST=$list"
+    echo "DATE=$(date -Is 2>/dev/null || date)"
+    echo
+    while IFS= read -r line; do
+      case "$line" in
+        ""|\#*) continue ;;
+      esac
+      echo "--> $line"
+      if [ "$force" = "yes" ]; then
+        box add "$line" --force
+      else
+        box add "$line"
+      fi
+      echo
+    done < "$list"
+  } | tee "$out"
+  echo "box: ok: world run logged to $out"
+}
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  init) box_init ;;
+  add) box_add "$@" ;;
+  rm) box_rm "$@" ;;
+  adopt) box_adopt "$@" ;;
+  own) box_own "$@" ;;
+  list) box_list ;;
+  info) box_info "$@" ;;
+  world) box_world "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command: $cmd (try: box --help)" ;;
+esac
