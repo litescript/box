@@ -19,6 +19,7 @@ box - ls-box package tool
 
 Usage:
   box init
+  box new (creates recipe for package)
   box add <recipe> [--force]
   box rm <name-ver>
   box own <absolute-path>
@@ -127,6 +128,95 @@ commit_stage() {
   # Copy staged tree into /
   ( cd "$DESTDIR" && tar cf - . ) | ( cd / && tar xpf - )
 }
+
+box_new() {
+  # Require a controlling TTY 
+  [ -r /dev/tty ] || die "error: no controlling tty"
+
+  prompt() {
+    _q="$1"; _def="${2-}"
+
+    if [ -n "$_def" ]; then
+      printf "%s [%s]: " "$_q" "$_def" >&2
+    else
+      printf "%s: " "$_q" >&2
+    fi
+
+    IFS= read -r _ans </dev/tty || _ans=""
+
+    if [ -z "${_ans:-}" ]; then
+      printf "%s" "$_def"
+    else
+      printf "%s" "$_ans"
+    fi
+  }
+
+  PKG="$(prompt "PKG name" "")"
+  [ -n "$PKG" ] || die "PKG required"
+
+  VER="$(prompt "Version" "")"
+  [ -n "$VER" ] || die "VER required"
+
+  DEF_SRC="/sources/${PKG}-${VER}.tar.gz"
+  SRC="$(prompt "Source tarball path" "$DEF_SRC")"
+
+  DESC="$(prompt "Short description" "$PKG")"
+  PREFIX="$(prompt "Install prefix" "/usr")"
+  TESTS="$(prompt "Run tests? (y/n)" "n")"
+
+  case "$SRC" in
+    *.tar.lz) EXTRACT='lzip -dc "$SRC" | tar -xf - -C "$WORKDIR"' ;;
+    *.tar.gz|*.tgz|*.tar.xz|*.tar.bz2|*.tar)
+              EXTRACT='tar -xf "$SRC" -C "$WORKDIR"' ;;
+    *)        EXTRACT='tar -xf "$SRC" -C "$WORKDIR"' ;;
+  esac
+
+  if [ "$TESTS" = "y" ] || [ "$TESTS" = "Y" ]; then
+    CHECK='make check'
+  else
+    CHECK=': # make check'
+  fi
+
+  OUT_DEFAULT="$HOME/ls-box/recipes/$PKG-$VER.sh"
+  OUT="$(prompt "Output recipe path" "$OUT_DEFAULT")"
+  mkdir -p "$(dirname "$OUT")"
+
+  cat >"$OUT" <<EOF_RECIPE
+PKG=$PKG
+VER=$VER
+SRC=$SRC
+DESC="$DESC"
+
+build() {
+  WORKDIR="/tmp/box-work/\$PKG-\$VER"
+  rm -rf "\$WORKDIR"
+  command install -d "\$WORKDIR"
+
+  $EXTRACT
+
+  TOPDIR="\$(find "\$WORKDIR" -mindepth 1 -maxdepth 1 -type d | sed -n '1p')"
+  [ -n "\$TOPDIR" ] || { echo "no topdir after extract" >&2; exit 1; }
+  cd "\$TOPDIR"
+
+  if [ -x ./configure ]; then
+    ./configure --prefix=$PREFIX
+  fi
+  make
+  $CHECK
+}
+
+pkg_install() {
+  TOPDIR="\$(find "/tmp/box-work/\$PKG-\$VER" -mindepth 1 -maxdepth 1 -type d | sed -n '1p')"
+  [ -n "\$TOPDIR" ] || { echo "no topdir for install" >&2; exit 1; }
+  cd "\$TOPDIR"
+  make DESTDIR="\$DESTDIR" install
+}
+EOF_RECIPE
+
+  chmod 644 "$OUT"
+  echo "ok: wrote $OUT"
+}
+
 
 box_add() {
   need_root
@@ -367,6 +457,7 @@ shift || true
 
 case "$cmd" in
   init) box_init ;;
+  new) box_new ;;
   add) box_add "$@" ;;
   rm) box_rm "$@" ;;
   adopt) box_adopt "$@" ;;
