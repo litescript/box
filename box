@@ -1,5 +1,6 @@
-#!/bin/sh
-set -eu
+#!/bin/bash
+export LC_ALL=C
+set -euo pipefail
 
 DB=/var/lib/box
 MAN="$DB/manifests"
@@ -32,7 +33,7 @@ Recipe conventions:
   A recipe is a shell file that defines:
     PKG=name
     VER=version
-    SRC=/sources/pkg-ver.tar.xz   (optional)
+    SRC=/sources/pkg-ver.tar.xz
     configure() { ... }           (optional)
     build() { ... }               (optional)
     pkg_install() { ... }         (required; must install into "\$DESTDIR")
@@ -125,8 +126,14 @@ check_collisions() {
 }
 
 commit_stage() {
-  # Copy staged tree into /
-  ( cd "$DESTDIR" && tar cf - . ) | ( cd / && tar xpf - )
+  [ -d "$DESTDIR" ] || die "no DESTDIR: $DESTDIR"
+
+  local tmp
+  tmp="$(mktemp -p "${TMPDIR:-/tmp}" "box-stage.XXXXXX.tar")"
+  trap 'rm -f "$tmp"' RETURN
+
+  ( cd "$DESTDIR" && tar cpf "$tmp" . ) || die "tar pack failed"
+  ( cd / && tar xpf "$tmp" ) || die "tar extract failed"
 }
 
 box_new() {
@@ -237,10 +244,15 @@ box_add() {
   run_step() {
     step="$1"
     type "$step" >/dev/null 2>&1 || die "recipe missing $step()"
+
+    set -o pipefail
     (
       set -euo pipefail
       "$step"
     ) 2>&1 | tee -a "$LOG"
+
+    rc=$?
+    [ "$rc" -eq 0 ] || die "step failed: $step (exit $rc)"
   }
 
   run_step build
@@ -423,32 +435,46 @@ box_info() {
 box_world() {
   need_root
   [ $# -ge 1 ] || die "world requires a list file"
+
+  local list force runid out rc
   list="$1"
   force="no"
   if [ "${2:-}" = "--force" ]; then force="yes"; fi
+
   [ -f "$list" ] || die "list not found: $list"
 
   runid="world-$(date +%Y%m%d-%H%M%S 2>/dev/null || date)"
   out="$STATE/$runid.log"
 
+  # ensure state dir exists (safe no-op if already present)
+  mkdir -p "$STATE" || die "cannot create state dir: $STATE"
+
+  # IMPORTANT: tee must not mask failures
+  set -o pipefail
   {
     echo "== box world =="
     echo "LIST=$list"
     echo "DATE=$(date -Is 2>/dev/null || date)"
     echo
+
     while IFS= read -r line; do
       case "$line" in
         ""|\#*) continue ;;
       esac
+
       echo "--> $line"
       if [ "$force" = "yes" ]; then
-        box add "$line" --force
+        box add "$line" --force || die "world failed on: $line"
       else
-        box add "$line"
+        box add "$line" || die "world failed on: $line"
       fi
       echo
     done < "$list"
-  } | tee "$out"
+  } 2>&1 | tee "$out"
+  rc=$?
+  set +o pipefail || true
+
+  [ $rc -eq 0 ] || die "world run failed (rc=$rc). log: $out"
   echo "box: ok: world run logged to $out"
 }
 
