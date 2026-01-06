@@ -1,0 +1,629 @@
+#!/bin/bash
+export LC_ALL=C
+set -euo pipefail
+
+DB=/var/lib/box
+MAN="$DB/manifests"
+META="$DB/meta"
+LOGS="$DB/logs"
+STATE="$DB/state"
+
+# Prefer the invoking user's home when running under sudo.
+USER_HOME=""
+if [ -n "${SUDO_USER:-}" ]; then
+  USER_HOME="$(getent passwd "$SUDO_USER" | cut -d: -f6)"
+fi
+USER_HOME="${USER_HOME:-$HOME}"
+RECIPE_DIR="${RECIPE_DIR:-$USER_HOME/ls-box/recipes}"
+
+die(){ echo "box: $*" >&2; exit 1; }
+
+need_root() {
+  [ "$(id -u)" -eq 0 ] || die "run as root (or via sudo)."
+}
+
+usage() {
+  cat <<USAGE
+box - ls-box package tool
+
+Usage:
+  box init
+  box new (creates recipe for package)
+  box add <recipe> [--force]
+  box rm <name-ver>
+  box own <absolute-path>
+  box list
+  box info <name-ver>
+  box world <listfile> [--force]
+  box adopt <name> <ver> <absolute-path> [--src <path>] [--desc <text>]
+
+Recipe conventions:
+  A recipe is a shell file that defines:
+    PKG=name
+    VER=version
+    SRC=/sources/pkg-ver.tar.xz
+    configure() { ... }           (optional)
+    build() { ... }               (optional)
+    pkg_install() { ... }         (required; must install into "\$DESTDIR")
+USAGE
+}
+
+box_init() {
+  need_root
+  command install -d "$DB" "$MAN" "$META" "$LOGS" "$STATE"
+  echo "box: ok: initialized $DB"
+}
+
+load_recipe() {
+  RECIPE="$(resolve_recipe "$1")"
+  [ -f "$RECIPE" ] || die "recipe not found: $RECIPE"
+  # shellcheck disable=SC1090
+  . "$RECIPE"
+  : "${PKG:?recipe must set PKG=...}"
+  : "${VER:?recipe must set VER=...}"
+  type pkg_install >/dev/null 2>&1 || die "recipe must define pkg_install() { ... }"
+  PKGID="${PKG}-${VER}"
+}
+
+resolve_recipe() {
+  # Usage: resolve_recipe <arg>
+  # Prints resolved recipe path on stdout, or dies.
+  local arg="$1"
+
+  # Expand "~/" safely (tilde doesn't expand from variables).
+  if [[ "$arg" == "~/"* ]]; then
+    arg="${USER_HOME:-$HOME}/${arg#~/}"
+  fi
+
+  # Path-like? leave it alone.
+  case "$arg" in
+    */*|.|..|./*|../*)
+      [ -f "$arg" ] || die "recipe not found: $arg"
+      printf '%s\n' "$arg"
+      return 0
+      ;;
+  esac
+
+  # Try default directory
+  if [ -f "$RECIPE_DIR/$arg" ]; then
+    printf '%s\n' "$RECIPE_DIR/$arg"
+    return 0
+  fi
+
+  # Allow omitting .sh
+  if [[ "$arg" != *.sh ]] && [ -f "$RECIPE_DIR/$arg.sh" ]; then
+    printf '%s\n' "$RECIPE_DIR/$arg.sh"
+    return 0
+  fi
+
+  # Allow PKG-VER naming: arg-*.sh
+  local -a vers=()
+  shopt -s nullglob
+  vers=( "$RECIPE_DIR/$arg"-*.sh )
+  shopt -u nullglob
+
+  if ((${#vers[@]} == 1)); then
+    printf '%s\n' "${vers[0]}"
+    return 0
+  fi
+
+  if ((${#vers[@]} > 1)); then
+    # Deterministic: pick the "highest" by version-like sort on basename
+    # (Assumes filenames like pinentry-1.3.2.sh)
+    local pick=""
+    pick="$(
+      printf '%s\n' "${vers[@]##*/}" \
+        | sort -V \
+        | tail -n 1
+    )"
+    printf '%s\n' "$RECIPE_DIR/$pick"
+    return 0
+  fi
+
+  die "recipe not found: $arg (tried: $RECIPE_DIR/$arg, $RECIPE_DIR/$arg.sh, $RECIPE_DIR/$arg-*.sh). Set RECIPE_DIR or pass a path."
+}
+
+stage_dir() {
+  DESTDIR="/tmp/box-stage/$PKGID"
+  rm -rf "$DESTDIR"
+  command install -d "$DESTDIR"
+}
+
+write_meta() {
+  ts="$(date -Is 2>/dev/null || date)"
+  meta_file="$META/$PKGID.meta"
+  {
+    echo "PKG=$PKG"
+    echo "VER=$VER"
+    echo "PKGID=$PKGID"
+    echo "DATE=$ts"
+    [ "${SRC:-}" ] && echo "SRC=$SRC"
+    [ "${DESC:-}" ] && echo "DESC=$DESC"
+  } > "$meta_file"
+}
+
+make_manifest() {
+  mf="$MAN/$PKGID.files"
+  (
+    cd "$DESTDIR"
+    find . -mindepth 1 \
+      ! -path './usr/share/info/dir' \
+      -print | sort
+  ) > "$mf"
+}
+
+check_collisions() {
+  force="${1:-no}"
+  mf="$MAN/$PKGID.files"
+  collisions="/tmp/box-collisions.$PKGID.$$"
+  : > "$collisions"
+
+  # For each staged path, check if it would overwrite something on /
+  while IFS= read -r p; do
+    # strip leading ./
+    rel="${p#./}"
+    [ -n "$rel" ] || continue
+    target="/$rel"
+
+  case "$target" in
+    /usr/share/info/dir)
+      continue
+      ;;
+  esac
+
+    if [ -e "$target" ] || [ -L "$target" ]; then
+      # allow if target is a directory and we're also a directory
+      if [ -d "$target" ] && [ -d "$DESTDIR/$rel" ]; then
+        continue
+      fi
+      echo "$target" >> "$collisions"
+    fi
+  done < "$mf"
+
+  if [ -s "$collisions" ] && [ "$force" != "yes" ]; then
+    echo "box: collisions detected; refusing to overwrite." >&2
+    echo "box: re-run with --force to allow overwrites." >&2
+    echo "---- collisions ----" >&2
+    cat "$collisions" >&2
+    rm -f "$collisions"
+    exit 1
+  fi
+  rm -f "$collisions"
+}
+
+commit_stage() {
+  [ -d "$DESTDIR" ] || die "no DESTDIR: $DESTDIR"
+
+  local tmp=""
+  tmp="$(mktemp -p "${TMPDIR:-/tmp}" "box-stage.XXXXXX.tar")"
+  trap 'rm -f "$tmp"' RETURN
+
+  ( cd "$DESTDIR" && tar cpf "$tmp" . ) || die "tar pack failed"
+  ( cd / && tar xpf "$tmp" ) || die "tar extract failed"
+}
+
+guess_src() {
+  # Usage: guess_src <PKG> <VER>
+  # Prints the chosen default SRC path on stdout.
+  #
+  # Rule:
+  # - If exactly 1 match found in /sources for PKG+VER, use it.
+  # - If 0 matches, fall back to /sources/PKG-VER.tar.xz
+  # - If >1 matches:
+  #     - if fzf exists and we have a TTY, prompt to select one
+  #     - otherwise, fall back and print a short note
+
+  local pkg="$1" ver="$2"
+  local fallback="/sources/${pkg}-${ver}.tar.xz"
+  local -a matches=()
+  local pat
+
+  # Patterns in order of preference
+  for pat in \
+    "/sources/${pkg}-${ver}."* \
+    "/sources/${pkg}_${ver}."* \
+    "/sources/${pkg}-${ver}"* \
+  ; do
+    shopt -s nullglob
+    matches+=( $pat )
+    shopt -u nullglob
+
+    if ((${#matches[@]} > 0)); then
+      break
+    fi
+  done
+
+  if ((${#matches[@]} == 1)); then
+    printf '%s\n' "${matches[0]}"
+    return 0
+  fi
+
+  if ((${#matches[@]} > 1)); then
+    # Interactive selection if possible
+    if command -v fzf >/dev/null 2>&1 && [ -t 0 ] && [ -r /dev/tty ]; then
+      local choice=""
+      choice="$(printf '%s\n' "${matches[@]}" \
+          | fzf --prompt="Select SRC for ${pkg}-${ver}> " </dev/tty
+      )" || choice=""
+
+      if [ -n "${choice:-}" ]; then
+        printf '%s\n' "$choice"
+        return 0
+      fi
+
+      # If user cancels fzf, fall back quietly
+      printf '%s\n' "$fallback"
+      return 0
+    fi
+
+    # Non-interactive / no fzf: warn and fall back
+    echo "note: multiple /sources matches for ${pkg}-${ver}; using fallback and you should pick one:" >&2
+    local m
+    for m in "${matches[@]}"; do
+      echo "  - ${m##*/}" >&2
+    done
+  fi
+
+  printf '%s\n' "$fallback"
+}
+
+box_new() {
+  # Require a controlling TTY 
+  [ -r /dev/tty ] || die "error: no controlling tty"
+
+  prompt() {
+    _q="$1"; _def="${2-}"
+
+    if [ -n "$_def" ]; then
+      printf "%s [%s]: " "$_q" "$_def" >&2
+    else
+      printf "%s: " "$_q" >&2
+    fi
+
+    IFS= read -r _ans </dev/tty || _ans=""
+
+    if [ -z "${_ans:-}" ]; then
+      printf "%s" "$_def"
+    else
+      printf "%s" "$_ans"
+    fi
+  }
+
+  PKG="$(prompt "PKG name" "")"
+  [ -n "$PKG" ] || die "PKG required"
+
+  VER="$(prompt "Version" "")"
+  [ -n "$VER" ] || die "VER required"
+
+  local SRC_DEFAULT=""
+  SRC_DEFAULT="$(guess_src "$PKG" "$VER")"
+  SRC="$(prompt "Source tarball path" "$SRC_DEFAULT")"
+
+  DESC="$(prompt "Short description" "$PKG")"
+  PREFIX="$(prompt "Install prefix" "/usr")"
+  TESTS="$(prompt "Run tests? (y/n)" "n")"
+
+  case "$SRC" in
+    *.tar.lz) EXTRACT='lzip -dc "$SRC" | tar -xf - -C "$WORKDIR"' ;;
+    *.tar.gz|*.tgz|*.tar.xz|*.tar.bz2|*.tar)
+              EXTRACT='tar -xf "$SRC" -C "$WORKDIR"' ;;
+    *)        EXTRACT='tar -xf "$SRC" -C "$WORKDIR"' ;;
+  esac
+
+  if [ "$TESTS" = "y" ] || [ "$TESTS" = "Y" ]; then
+    CHECK='make check'
+  else
+    CHECK=': # make check'
+  fi
+
+  OUT_DEFAULT="$HOME/ls-box/recipes/$PKG-$VER.sh"
+  OUT="$(prompt "Output recipe path" "$OUT_DEFAULT")"
+  mkdir -p "$(dirname "$OUT")"
+
+  cat >"$OUT" <<EOF_RECIPE
+# Generated by box new
+PKG=$PKG
+VER=$VER
+SRC=$SRC
+DESC="$DESC"
+
+build() {
+  WORKDIR="/tmp/box-work/\$PKG-\$VER"
+  rm -rf "\$WORKDIR"
+  command install -d "\$WORKDIR"
+
+  $EXTRACT
+
+  TOPDIR="\$(find "\$WORKDIR" -mindepth 1 -maxdepth 1 -type d | sed -n '1p')"
+  [ -n "\$TOPDIR" ] || { echo "no topdir after extract" >&2; exit 1; }
+  cd "\$TOPDIR"
+
+  if [ -x ./configure ]; then
+    ./configure --prefix=$PREFIX
+  fi
+  make
+  $CHECK
+}
+
+pkg_install() {
+  TOPDIR="\$(find "/tmp/box-work/\$PKG-\$VER" -mindepth 1 -maxdepth 1 -type d | sed -n '1p')"
+  [ -n "\$TOPDIR" ] || { echo "no topdir for install" >&2; exit 1; }
+  cd "\$TOPDIR"
+  make DESTDIR="\$DESTDIR" install
+}
+EOF_RECIPE
+
+  chmod 644 "$OUT"
+  echo "ok: wrote $OUT"
+}
+
+
+box_add() {
+  need_root
+  [ $# -ge 1 ] || die "usage: box add <recipe> [--force]"
+  force=no
+  [ "${2-}" = "--force" ] && force=yes
+
+  load_recipe "$1"                 # sources recipe
+  : "${PKG:?}" "${VER:?}" "${SRC:?}"
+  PKGID="$PKG-$VER"
+
+  stage_dir                         # sets DESTDIR
+
+  command install -d "$LOGS"
+  LOG="$LOGS/$PKGID.$(date +%Y%m%d-%H%M%S).log"
+  : >"$LOG"                         # ensure file exists even if we die next
+
+  run_step() {
+    step="$1"
+    type "$step" >/dev/null 2>&1 || die "recipe missing $step()"
+
+    set -o pipefail
+    (
+      set -euo pipefail
+      "$step"
+    ) 2>&1 | tee -a "$LOG"
+
+    rc=$?
+    [ "$rc" -eq 0 ] || die "step failed: $step (exit $rc)"
+  }
+
+  run_step build
+  run_step pkg_install
+
+  make_manifest
+  check_collisions "$force"
+  commit_stage
+  write_meta
+
+  echo "box: ok: installed $PKGID"
+}
+
+box_rm() {
+  need_root
+  [ $# -eq 1 ] || die "rm requires <name-ver>"
+  PKGID="$1"
+  mf="$MAN/$PKGID.files"
+  [ -f "$mf" ] || die "manifest not found: $mf"
+
+  # Remove files/symlinks first
+  while IFS= read -r p; do
+    rel="${p#./}"
+    [ -n "$rel" ] || continue
+    target="/$rel"
+    case "$target" in
+      /|""|"/."|"/.."|*/../*|*/..|*/./*|*/.|*/..)
+        die "invalid or dangerous path in manifest: $target"
+        ;;
+    esac
+    case "$target" in
+      /usr/share/info/dir) continue ;;
+    esac
+
+    if [ -L "$target" ] || [ -f "$target" ]; then
+      rm -f "$target"
+    fi
+  done < "$mf"
+
+  # Then remove empty directories, deepest-first
+  # (manifest includes dirs too because find prints them)
+
+  if command -v tac >/dev/null 2>&1; then
+    TAC="tac"
+  else
+    die "tac not found (coreutils). Install it or provide a reverse-order tool."
+  fi
+
+  $TAC "$mf" | while IFS= read -r p; do
+    rel="${p#./}"
+    [ -n "$rel" ] || continue
+    target="/$rel"
+    case "$target" in
+      /|""|"/."|"/.."|*/../*|*/..|*/./*|*/.|*/..)
+        die "invalid or dangerous path in manifest: $target"
+        ;;
+    esac
+
+    case "$target" in
+      /usr/share/info/dir) continue ;;
+    esac
+
+    if [ -d "$target" ]; then
+      rmdir "$target" 2>/dev/null || true
+    fi
+  done
+
+  rm -f "$mf" "$META/$PKGID.meta"
+  echo "box: ok: removed $PKGID"
+}
+
+box_adopt() {
+  need_root
+  [ $# -ge 3 ] || die "usage: box adopt <name> <ver> <absolute-path> [--src <path>] [--desc <text>]"
+  PKG="$1"; VER="$2"; path="$3"; shift 3
+  PKGID="${PKG}-${VER}"
+
+  case "$path" in
+    /*) ;;
+    *) die "path must be absolute: $path" ;;
+  esac
+  [ -e "$path" ] || die "path not found: $path"
+
+  # parse optional flags
+  SRC=""
+  DESC=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --src)
+        [ $# -ge 2 ] || die "--src requires a value"
+        SRC="$2"; shift 2
+        ;;
+      --desc)
+        [ $# -ge 2 ] || die "--desc requires a value"
+        DESC="$2"; shift 2
+        ;;
+      *)
+        die "unknown option for adopt: $1"
+        ;;
+    esac
+  done
+
+  # refuse if already adopted/installed
+  [ ! -f "$MAN/$PKGID.files" ] || die "manifest already exists: $MAN/$PKGID.files"
+  [ ! -f "$META/$PKGID.meta" ] || die "meta already exists: $META/$PKGID.meta"
+
+  # refuse if some other package already "owns" this path
+  if box own "$path" >/dev/null 2>&1; then
+    owner="$(box own "$path" || true)"
+    die "path is already owned by: $owner"
+  fi
+
+  # Write manifest: include parent dirs + the path itself, all as ./-prefixed relpaths
+  mf="$MAN/$PKGID.files"
+  tmp="/tmp/box-adopt.$PKGID.$$"
+  : > "$tmp"
+
+  rel="${path#/}"   # drop leading /
+  # add parent directories, stopping before empty
+  d="$rel"
+  while :; do
+    d="$(dirname "$d")"
+    [ "$d" = "." ] && break
+    echo "./$d" >> "$tmp"
+  done
+
+  # add the exact path entry
+  echo "./$rel" >> "$tmp"
+
+  # de-dupe and sort like other manifests
+  LC_ALL=C sort -u "$tmp" > "$mf"
+  rm -f "$tmp"
+
+  # Write meta (reusing same format)
+  ts="$(date -Is 2>/dev/null || date)"
+  meta_file="$META/$PKGID.meta"
+  {
+    echo "PKG=$PKG"
+    echo "VER=$VER"
+    echo "PKGID=$PKGID"
+    echo "DATE=$ts"
+    [ -n "$SRC" ] && echo "SRC=$SRC"
+    [ -n "$DESC" ] && echo "DESC=$DESC"
+  } > "$meta_file"
+
+  echo "box: ok: adopted $PKGID ($path)"
+}
+
+box_own() {
+  [ $# -eq 1 ] || die "own requires an absolute path"
+  path="$1"
+  case "$path" in
+    /*) ;;
+    *) die "path must be absolute: $path" ;;
+  esac
+
+  found="no"
+  for mf in "$MAN"/*.files; do
+    [ -f "$mf" ] || continue
+    # match either file or directory exact path
+    if grep -qx "./${path#/}" "$mf"; then
+      echo "$(basename "$mf" .files)"
+      found="yes"
+    fi
+  done
+  [ "$found" = "yes" ] || exit 1
+}
+
+box_list() {
+  ls "$META" 2>/dev/null | sed 's/\.meta$//' | sort
+}
+
+box_info() {
+  [ $# -eq 1 ] || die "info requires <name-ver>"
+  f="$META/$1.meta"
+  [ -f "$f" ] || die "meta not found: $f"
+  cat "$f"
+}
+
+box_world() {
+  need_root
+  [ $# -ge 1 ] || die "world requires a list file"
+
+  local list force runid out rc
+  list="$1"
+  force="no"
+  if [ "${2:-}" = "--force" ]; then force="yes"; fi
+
+  [ -f "$list" ] || die "list not found: $list"
+
+  runid="world-$(date +%Y%m%d-%H%M%S 2>/dev/null || date)"
+  out="$STATE/$runid.log"
+
+  # ensure state dir exists (safe no-op if already present)
+  mkdir -p "$STATE" || die "cannot create state dir: $STATE"
+
+  # IMPORTANT: tee must not mask failures
+  set -o pipefail
+  {
+    echo "== box world =="
+    echo "LIST=$list"
+    echo "DATE=$(date -Is 2>/dev/null || date)"
+    echo
+
+    while IFS= read -r line; do
+      case "$line" in
+        ""|\#*) continue ;;
+      esac
+
+      echo "--> $line"
+      if [ "$force" = "yes" ]; then
+        box add "$line" --force || die "world failed on: $line"
+      else
+        box add "$line" || die "world failed on: $line"
+      fi
+      echo
+    done < "$list"
+  } 2>&1 | tee "$out"
+  rc=$?
+  set +o pipefail || true
+
+  [ $rc -eq 0 ] || die "world run failed (rc=$rc). log: $out"
+  echo "box: ok: world run logged to $out"
+}
+
+cmd="${1:-}"
+shift || true
+
+case "$cmd" in
+  init) box_init ;;
+  new) box_new ;;
+  add) box_add "$@" ;;
+  rm) box_rm "$@" ;;
+  adopt) box_adopt "$@" ;;
+  own) box_own "$@" ;;
+  list) box_list ;;
+  info) box_info "$@" ;;
+  world) box_world "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command: $cmd (try: box --help)" ;;
+esac
