@@ -3,7 +3,7 @@
 Minimal source package manager / install helper for my LFS system.
 
 box builds packages from simple shell “recipes”, installs into a staging root (DESTDIR), generates a file manifest,
-checks for collisions, then commits the staged files into /. It is intentionally small, explicit, and predictable.
+checks for collisions, then commits the staged files into /. It is intentionally explicit and predictable.
 
 ## Design goals
 
