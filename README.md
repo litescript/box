@@ -59,12 +59,12 @@ Notes:
 
 ## Commands
 
-- box new <name>          — start recipe creation tool for package <name>, fuzzy searching of /sources for tarball
-- box add <recipe>        — build + stage + install a package from a recipe
-- box rm <PKG> <VER>      — remove an installed package using its manifest
+- box new '<name>'          — start recipe creation tool for package '<name>', fuzzy searching of /sources for tarball
+- box add '<recipe>'        — build + stage + install a package from a recipe
+- box rm '<PKG> <VER>'      — remove an installed package using its manifest
 - box list                — list installed packages
-- box world <listfile>    — install a list of recipes; stops on first failure
-- box adopt <name> <path> — retroactively track already-installed files
+- box world '<listfile>'    — install a list of recipes; stops on first failure
+- box adopt '<name> <path>' — retroactively track already-installed files
 
 ## License
 
