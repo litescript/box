@@ -12,7 +12,7 @@ checks for collisions, then commits the staged files into /. It is intentionally
 - Simple, auditable recipes: plain bash with build() and pkg_install() functions.
 - Deterministic output: locale forced to LC_ALL=C for stable sorting/manifests.
 
-## Failure semantics (important)
+## Failure semantics
 
 box runs in strict mode and enforces pipeline failures:
 
