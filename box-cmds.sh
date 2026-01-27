@@ -5,7 +5,7 @@ export LC_ALL=C
 
 box_init() {
   need_root
-  command install -d "$DB" "$MAN" "$META" "$LOGS" "$STATE"
+  command install -d "$DB" "$DB/installed" "$MAN" "$META" "$LOGS" "$STATE"
   echo "box: ok: initialized $DB"
 }
 
@@ -91,6 +91,26 @@ EOF_RECIPE
   echo "ok: wrote $OUT"
 }
 
+box_record_install() {
+  local inst
+  inst="$DB/installed/$PKGID"
+
+  command install -d "$DB/installed" "$inst"
+
+  [ -f "$META/$PKGID.meta" ]     || die "missing meta: $META/$PKGID.meta"
+  [ -f "$MAN/$PKGID.files" ]     || die "missing files manifest: $MAN/$PKGID.files"
+  [ -f "$MAN/$PKGID.payload" ]   || die "missing payload manifest: $MAN/$PKGID.payload"
+  [ -f "$MAN/$PKGID.dirs" ]      || die "missing dirs manifest: $MAN/$PKGID.dirs"
+
+  cp -f -- "$META/$PKGID.meta"     "$inst/meta"
+  cp -f -- "$MAN/$PKGID.files"    "$inst/files"
+  cp -f -- "$MAN/$PKGID.payload"  "$inst/payload"
+  cp -f -- "$MAN/$PKGID.dirs"     "$inst/dirs"
+
+  # Optional: keep the build log with the install record
+  [ -n "${LOG:-}" ] && [ -f "$LOG" ] && cp -f -- "$LOG" "$inst/install.log" || true
+}
+
 box_add() {
   need_root
   [ $# -ge 1 ] || die "usage: box add <recipe> [--force]"
@@ -129,9 +149,11 @@ box_add() {
   run_step pkg_install
 
   make_manifest
+  write_meta
   check_collisions "$force"
   commit_stage
-  write_meta
+  owners_register_payload
+  box_record_install
 
   echo "box: ok: installed $PKGID"
 }
@@ -140,9 +162,22 @@ box_rm() {
   need_root
   [ $# -eq 1 ] || die "rm requires <name-ver>"
   local PKGID="$1"
-  local mf="$MAN/$PKGID.files"
-  [ -f "$mf" ] || die "manifest not found: $mf"
 
+  local inst="$DB/installed/$PKGID"
+  local payload dirs
+
+  [ -d "$inst" ] || die "not installed: $PKGID"
+
+  payload="$inst/payload"
+  dirs="$inst/dirs"
+
+  [ -f "$payload" ] || die "payload manifest not found: $payload"
+  [ -f "$dirs" ] || die "dirs manifest not found: $dirs"
+
+  owners_unregister_payload_from_file "$PKGID" "$payload"
+  owners_prune_pkgid "$PKGID"   # optional: cleans any strays
+
+  # Remove files/symlinks
   while IFS= read -r p; do
     local rel target
     rel="${p#./}"
@@ -156,46 +191,46 @@ box_rm() {
       /usr/share/info/dir) continue ;;
     esac
 
-    if [ -L "$target" ] || [ -f "$target" ]; then
-      rm -f "$target"
+    # payload should only contain files/symlinks, but stay defensive
+    if [ -d "$target" ] && [ ! -L "$target" ]; then
+      continue
     fi
-  done < "$mf"
 
-  if command -v tac >/dev/null 2>&1; then
-    TAC="tac"
-  else
-    die "tac not found (coreutils). Install it or provide a reverse-order tool."
-  fi
+    if [ -L "$target" ] || [ -f "$target" ]; then
+      rm -f -- "$target"
+    fi
+  done < "$payload"
 
-  $TAC "$mf" | while IFS= read -r p; do
+  # Prune directories (dirs manifest is already deepest-first)
+  while IFS= read -r p; do
     local rel target
     rel="${p#./}"
     [ -n "$rel" ] || continue
     target="/$rel"
 
     case "$target" in
-      /|""|"/."|"/.."|*/../*|*/..|*/./*|*/.|*/..) die "invalid or dangerous path in manifest: $target" ;;
-    esac
-    case "$target" in
-      /usr/share/info/dir) continue ;;
+      /|""|"/."|"/.."|*/../*|*/..|*/./*|*/.|*/..) die "invalid or dangerous path in dirs manifest: $target" ;;
     esac
 
     if [ -d "$target" ]; then
-      rmdir "$target" 2>/dev/null || true
+      rmdir -- "$target" 2>/dev/null || true
     fi
-  done
+  done < "$dirs"
 
-  rm -f "$mf" "$META/$PKGID.meta"
+  # Remove install record (authoritative). Also clean legacy crumbs if present.
+  rm -rf -- "$inst" 2>/dev/null || true
+  rm -f -- "$MAN/$PKGID.files" "$MAN/$PKGID.payload" "$MAN/$PKGID.dirs" "$META/$PKGID.meta" 2>/dev/null || true
+
   echo "box: ok: removed $PKGID"
 }
 
 box_list() {
-  ls "$META" 2>/dev/null | sed 's/\.meta$//' | sort
+  ls "$DB/installed" 2>/dev/null | sort
 }
 
 box_info() {
   [ $# -eq 1 ] || die "info requires <name-ver>"
-  local f="$META/$1.meta"
+  local f="$DB/installed/$1/meta"
   [ -f "$f" ] || die "meta not found: $f"
   cat "$f"
 }
