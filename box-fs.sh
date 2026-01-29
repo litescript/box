@@ -20,6 +20,14 @@ write_meta() {
     echo "DATE=$ts"
     [ -n "${SRC:-}" ]  && echo "SRC=$SRC"
     [ -n "${DESC:-}" ] && echo "DESC=$DESC"
+
+    # Optional deps (space-separated)
+    if declare -p DEPENDS >/dev/null 2>&1; then
+      # DEPENDS is expected to be an array: DEPENDS=(zlib openssl)
+      if [ "${#DEPENDS[@]}" -gt 0 ]; then
+        echo "DEPENDS=${DEPENDS[*]}"
+      fi
+    fi
   } > "$meta_file"
 }
 

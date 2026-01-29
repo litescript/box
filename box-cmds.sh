@@ -111,6 +111,89 @@ box_record_install() {
   [ -n "${LOG:-}" ] && [ -f "$LOG" ] && cp -f -- "$LOG" "$inst/install.log" || true
 }
 
+# --- Dependency helpers (v1) ---
+
+installed_has_pkg() {
+  # true if any installed meta has PKG=<name>
+  local name="$1" mf
+  [ -n "$name" ] || return 1
+  [ -d "$DB/installed" ] || return 1
+
+  for mf in "$DB/installed"/*/meta; do
+    [ -f "$mf" ] || continue
+    if grep -qxF "PKG=$name" "$mf"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+pkg_name_for_pkgid() {
+  # echoes PKG from installed meta (preferred), else falls back to PKGID prefix
+  local pkgid="$1" mf
+  mf="$DB/installed/$pkgid/meta"
+  if [ -f "$mf" ]; then
+    awk -F= '$1=="PKG"{print $2; exit}' "$mf" 2>/dev/null || true
+    return 0
+  fi
+  printf "%s\n" "${pkgid%-*}"
+}
+
+deps_line_for_pkgid() {
+  # echoes the DEPENDS line value (space-separated) if present
+  local pkgid="$1" mf
+  mf="$DB/installed/$pkgid/meta"
+  [ -f "$mf" ] || return 1
+  awk -F= '$1=="DEPENDS"{sub(/^DEPENDS=/,""); print $2; exit}' "$mf" 2>/dev/null || true
+}
+
+check_depends_installed_or_die() {
+  # reads DEPENDS from current recipe environment (array) and validates installed set
+  if ! declare -p DEPENDS >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local dep missing=0
+  for dep in "${DEPENDS[@]}"; do
+    [ -n "${dep:-}" ] || continue
+    if ! installed_has_pkg "$dep"; then
+      echo "box: missing dependency: $dep" >&2
+      missing=1
+    fi
+  done
+
+  [ "$missing" -eq 0 ] || die "dependency check failed"
+}
+
+check_reverse_deps_or_die() {
+  # refuses removal if any installed package depends on target PKG
+  local target_pkg="$1"
+  [ -n "$target_pkg" ] || die "internal: missing target pkg name for reverse-dep check"
+
+  local mf pkgid deps dependers=""
+  [ -d "$DB/installed" ] || return 0
+
+  for mf in "$DB/installed"/*/meta; do
+    [ -f "$mf" ] || continue
+    pkgid="$(basename "$(dirname "$mf")")"
+
+    deps="$(awk -F= '$1=="DEPENDS"{print $2; exit}' "$mf" 2>/dev/null || true)"
+    [ -n "${deps:-}" ] || continue
+
+    case " $deps " in
+      *" $target_pkg "*)
+        dependers="${dependers}${dependers:+$'\n'}$pkgid"
+        ;;
+    esac
+  done
+
+  if [ -n "$dependers" ]; then
+    echo "box: refusing to remove '$target_pkg' — required by:" >&2
+    echo "$dependers" >&2
+    die "remove blocked by reverse dependencies"
+  fi
+}
+
 box_add() {
   need_root
   [ $# -ge 1 ] || die "usage: box add <recipe> [--force]"
@@ -121,6 +204,8 @@ box_add() {
   : "${PKG:?}" "${VER:?}"
   : "${SRC:=}"
   PKGID="$PKG-$VER"
+
+  check_depends_installed_or_die
 
   stage_dir
   WORKDIR="/tmp/box-work/$PKG-$VER"
@@ -163,6 +248,10 @@ box_rm() {
   need_root
   [ $# -eq 1 ] || die "rm requires <name-ver>"
   local PKGID="$1"
+
+  local target_pkg=""
+  target_pkg="$(pkg_name_for_pkgid "$PKGID")"
+  check_reverse_deps_or_die "$target_pkg"
 
   local inst="$DB/installed/$PKGID"
   local payload dirs
