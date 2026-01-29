@@ -205,6 +205,15 @@ box_add() {
   : "${SRC:=}"
   PKGID="$PKG-$VER"
 
+  # Messaging only: same PKGID means reinstall/repair/upgrade semantics.
+  local is_reinstall=no
+  if [ -d "$DB/installed/$PKGID" ]; then
+    is_reinstall=yes
+    echo "box: reinstalling $PKGID"
+  else
+    echo "box: installing $PKGID"
+  fi
+
   check_depends_installed_or_die
 
   stage_dir
@@ -241,7 +250,11 @@ box_add() {
   owners_register_payload
   box_record_install
 
-  echo "box: ok: installed $PKGID"
+  if [ "$is_reinstall" = "yes" ]; then
+    echo "box: ok: reinstalled $PKGID"
+  else
+    echo "box: ok: installed $PKGID"
+  fi
 }
 
 box_rm() {
