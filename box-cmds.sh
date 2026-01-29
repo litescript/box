@@ -118,7 +118,8 @@ box_add() {
   [ "${2-}" = "--force" ] && force=yes
 
   load_recipe "$1"
-  : "${PKG:?}" "${VER:?}" "${SRC:?}"
+  : "${PKG:?}" "${VER:?}"
+  : "${SRC:=}"
   PKGID="$PKG-$VER"
 
   stage_dir

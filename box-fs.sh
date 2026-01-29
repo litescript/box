@@ -76,12 +76,12 @@ owners_get() {
 
 owners_set() {
   # set owner for abs path to current PKGID (idempotent)
-  local path="$1" tmp
+  local path="$1" tmp=""
   owners_db
 
   tmp="$(mktemp -p "$DB" "box-owners.XXXXXX")"
-  trap 'rm -f -- "$tmp"' RETURN
-
+  trap 'rm -f -- "${tmp:-}"' RETURN
+  
   awk -F'\t' -v p="$path" '$1!=p {print}' "$OWNERS" > "$tmp" || true
   printf "%s\t%s\n" "$path" "$PKGID" >> "$tmp"
   mv -f -- "$tmp" "$OWNERS"
@@ -89,23 +89,23 @@ owners_set() {
 
 owners_del_if_owned() {
   # delete ownership entry for abs path only if owned by given pkgid
-  local path="$1" pkgid="$2" tmp
+  local path="$1" pkgid="$2" tmp=""
   owners_db
 
   tmp="$(mktemp -p "$DB" "box-owners.XXXXXX")"
-  trap 'rm -f -- "$tmp"' RETURN
-
+  trap 'rm -f -- "${tmp:-}"' RETURN
+  
   awk -F'\t' -v p="$path" -v k="$pkgid" '!( $1==p && $2==k ) {print}' "$OWNERS" > "$tmp" || true
   mv -f -- "$tmp" "$OWNERS"
 }
 
 owners_prune_pkgid() {
   # remove all ownership entries for a PKGID (defensive cleanup on rm)
-  local pkgid="$1" tmp
+  local pkgid="$1" tmp=""
   owners_db
 
   tmp="$(mktemp -p "$DB" "box-owners.XXXXXX")"
-  trap 'rm -f -- "$tmp"' RETURN
+  trap 'rm -f -- "${tmp:-}"' RETURN
 
   awk -F'\t' -v k="$pkgid" '$2!=k {print}' "$OWNERS" > "$tmp" || true
   mv -f -- "$tmp" "$OWNERS"
@@ -160,8 +160,9 @@ check_collisions() {
   [ -s "$payload" ] || die "missing payload manifest: $payload"
   owners_db
 
+  local collisions=""
   collisions="$(mktemp -p "$DB" "box-collisions-${PKGID}.XXXXXX")"
-  trap 'rm -f -- "$collisions"' RETURN
+  trap 'rm -f -- "${collisions:-}"' RETURN
 
   while IFS= read -r p; do
     local rel target owner
@@ -216,7 +217,7 @@ commit_stage() {
 
   local tmp=""
   tmp="$(mktemp -p "$DB" "box-stage.XXXXXX.tar")"
-  trap 'rm -f -- "$tmp"' RETURN
+  trap 'rm -f -- "${tmp:-}"' RETURN
 
   ( cd "$DESTDIR" && tar cpf "$tmp" . ) || die "tar pack failed"
   ( cd / && tar xpf "$tmp" ) || die "tar extract failed"

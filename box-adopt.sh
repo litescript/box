@@ -99,11 +99,11 @@ box_adopt() {
   rel="${path#/}"  # drop leading /
 
   # temp files
-  local tmp_files tmp_payload tmp_dirs
+  local tmp_files="" tmp_payload="" tmp_dirs=""
   tmp_files="$(mktemp -p "${TMPDIR:-/tmp}" "box-adopt.${PKGID}.files.XXXXXX")"
   tmp_payload="$(mktemp -p "${TMPDIR:-/tmp}" "box-adopt.${PKGID}.payload.XXXXXX")"
   tmp_dirs="$(mktemp -p "${TMPDIR:-/tmp}" "box-adopt.${PKGID}.dirs.XXXXXX")"
-  trap 'rm -f -- "$tmp_files" "$tmp_payload" "$tmp_dirs" 2>/dev/null || true' RETURN
+  trap 'rm -f -- "${tmp_files:-}" "${tmp_payload:-}" "${tmp_dirs:-}" 2>/dev/null || true' RETURN
 
   : > "$tmp_files"
   : > "$tmp_payload"
