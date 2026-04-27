@@ -11,15 +11,17 @@ need_root() {
 
 usage() {
   cat <<USAGE
-box - ls-box package tool
+box - ls-box source package tool
 
 Usage:
   box init
   box new (creates recipe for package)
   box add <recipe> [--force]
+  box install <pkg> [--force]
   box rm <name-ver>
   box own <absolute-path>
   box list
+  box search <term>
   box info <name-ver>
   box world <listfile> [--force]
   box adopt <name> <ver> <absolute-path> [--src <path>] [--desc <text>]

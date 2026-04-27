@@ -406,6 +406,7 @@ main() {
     adopt) box_adopt "$@" ;;
     own) box_own "$@" ;;
     list) box_list ;;
+    search) box_search "$@" ;;
     info) box_info "$@" ;;
     world) box_world "$@" ;;
     ""|-h|--help|help) usage ;;

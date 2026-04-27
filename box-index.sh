@@ -81,3 +81,36 @@ _box_resolve() {
     box_add "$recipe"
   fi
 }
+
+box_search() {
+  [ $# -ge 1 ] || die "usage: box search <term>"
+
+  local term="$1"
+  index_require
+
+  awk -F'\t' -v q="$term" '
+    BEGIN {
+      found = 0
+    }
+
+    $0 ~ /^[[:space:]]*$/ { next }
+    $1 ~ /^#/ { next }
+
+    index($1, q) || index($3, q) {
+      found = 1
+      printf "%-24s %-14s %s", $1, $2, $3
+
+      if ($4 != "") {
+        printf "  deps: %s", $4
+      }
+
+      printf "\n"
+    }
+
+    END {
+      if (!found) {
+        exit 1
+      }
+    }
+  ' "$BOX_INDEX" || die "no packages found matching: $term"
+}
