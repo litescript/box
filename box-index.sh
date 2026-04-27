@@ -163,3 +163,27 @@ box_search() {
     }
   ' "$BOX_INDEX" || die "no packages found matching: $term"
 }
+
+box_available() {
+  [ $# -eq 0 ] || die "usage: box available"
+  index_require
+
+  awk -F'\t' '
+    $0 ~ /^[[:space:]]*$/ { next }
+    $1 ~ /^#/ { next }
+
+    {
+      printf "%-24s %-14s %s", $1, $2, $3
+
+      if ($4 != "") {
+        printf "  deps: %s", $4
+      }
+
+      if ($5 != "") {
+        printf "  — %s", $5
+      }
+
+      printf "\n"
+    }
+  ' "$BOX_INDEX"
+}

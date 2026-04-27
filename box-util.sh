@@ -22,6 +22,7 @@ Usage:
   box deps <pkg>
   box own <absolute-path>
   box list
+  box available
   box search <term>
   box info <name-ver>
   box world <listfile> [--force]

@@ -434,6 +434,7 @@ main() {
     deps) box_deps "$@" ;;
     own) box_own "$@" ;;
     list) box_list ;;
+    available) box_available "$@" ;;
     search) box_search "$@" ;;
     info) box_info "$@" ;;
     world) box_world "$@" ;;
