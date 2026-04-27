@@ -135,12 +135,22 @@ box_search() {
     $0 ~ /^[[:space:]]*$/ { next }
     $1 ~ /^#/ { next }
 
-    index($1, q) || index($3, q) {
+    {
+      haystack = tolower($1 " " $3 " " $5)
+      needle = tolower(q)
+    }
+
+    index(haystack, needle) {
       found = 1
+
       printf "%-24s %-14s %s", $1, $2, $3
 
       if ($4 != "") {
         printf "  deps: %s", $4
+      }
+
+      if ($5 != "") {
+        printf "  — %s", $5
       }
 
       printf "\n"
