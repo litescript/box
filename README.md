@@ -1,88 +1,80 @@
 # box
 
-box is a minimal, explicit source-based package manager and install helper for an LFS-style system.
+box is a minimal, explicit source-based package manager for an LFS-style system.
 
-It builds packages from simple shell “recipes”, installs into a staging root (DESTDIR), generates file manifests,
-checks for collisions, and then commits the staged files into /.
+It builds packages from simple shell “recipes”, installs into a staging root (DESTDIR),
+generates file manifests, checks for collisions, and commits the result into `/`.
 
-The design favors correctness, auditability, and predictable behavior over convenience.
+A higher-level index layer allows dependency-aware installs similar to `apt` or `pacman`,
+while keeping the underlying behavior fully transparent.
 
-------------------------------------------------------------------------------
+---
 
-DESIGN GOALS
+## DESIGN GOALS
 
-- Correctness over cleverness
-  Fail loudly. Partial installs are unacceptable.
+- **Correctness over convenience**  
+  No partial installs. Fail loudly.
 
-- Explicit lifecycle
+- **Explicit lifecycle**  
   build → stage → manifest → collision check → commit
 
-- Simple, auditable recipes
-  Plain bash with build() and pkg_install() functions.
+- **Auditable state**  
+  Every installed file is tracked.
 
-- Deterministic output
-  LC_ALL=C is enforced for stable sorting and manifests.
+- **Simple primitives**  
+  Plain bash recipes. No hidden magic.
 
-------------------------------------------------------------------------------
+---
 
-FAILURE SEMANTICS
+## INSTALL LIFECYCLE
 
-box runs in strict shell mode:
+Every install follows:
 
-- /bin/bash
-- set -euo pipefail
-- Pipelines logged with tee still propagate failures
+```
+build()
+→ pkg_install() into DESTDIR
+→ manifest generation
+→ collision check
+→ commit into /
+→ ownership registration
+```
 
-If any step fails (build, install, manifest generation, collision check, or commit),
-box add exits non-zero and no partial install is committed.
+If any step fails, nothing is installed.
 
-------------------------------------------------------------------------------
+---
 
-INSTALL SEMANTICS
+## STATE LAYOUT
 
-Fresh install:
+All state lives under:
 
-  box: installing <PKG>-<VER>
-  box: ok: installed <PKG>-<VER>
+```
+/var/lib/box
+```
 
-Reinstall (same PKG and VER):
+Structure:
 
-  box: reinstalling <PKG>-<VER>
-  box: ok: reinstalled <PKG>-<VER>
+```
+installed/    per-package records
+manifests/    generated file lists
+meta/         package metadata
+logs/         build/install logs
+state/        world runs, etc
+owners.tsv    path → package ownership
+```
 
-Reinstalling is intentional and performs a clean rebuild and reinstall of the package.
-This supports repair and rebuild workflows without requiring a version bump.
+---
 
-------------------------------------------------------------------------------
+## RECIPES
 
-STATE LAYOUT
+A recipe is a shell script:
 
-All state lives under /var/lib/box:
+```sh
+PKG=zlib
+VER=1.3.1
+SRC=/sources/zlib-1.3.1.tar.xz
+DESC="compression library"
 
-- installed/
-  Per-package install records:
-    files        All tracked paths (audit view)
-    payload      Files and symlinks (ownership, removal, collisions)
-    dirs         Directories, deepest-first (cleanup order)
-    meta         Package metadata
-    install.log  Install log for the run
-
-- owners.tsv
-  Ownership database mapping absolute paths to PKGID
-
-- logs/
-  Build and install logs per run
-
-------------------------------------------------------------------------------
-
-RECIPES
-
-A recipe is a bash script defining metadata and two functions:
-
-PKG=foo
-VER=1.2.3
-SRC=/sources/foo-1.2.3.tar.xz
-DESC="Optional description"
+DEPENDS=(...)
 
 build() {
   ./configure --prefix=/usr
@@ -92,46 +84,172 @@ build() {
 pkg_install() {
   make DESTDIR="$DESTDIR" install
 }
-
-Notes:
-- SRC is optional; box does not fetch sources automatically
-- Tests are optional; if enabled and they fail, the build fails
-- Recipes are executed with strict error handling
-
-------------------------------------------------------------------------------
-
-DEPENDENCIES
-
-Recipes may declare dependencies:
-
-DEPENDS=(zlib openssl)
+```
 
 Rules:
-- Dependencies must already be installed
-- Removal is blocked if another package depends on it
-- Reverse dependencies are reported on failure
 
-------------------------------------------------------------------------------
+- pkg_install() is required
+- must install into $DESTDIR
+- must be deterministic
+- runs with set -euo pipefail
 
-COMMANDS
+---
 
+## COMMANDS
+
+### Low-level
+
+```
 box add <recipe> [--force]
-  Build, stage, and install a package
+```
 
+Build and install a specific recipe file.
+
+---
+
+### High-level (index-backed)
+
+```
+box install <pkg> [--force]
+```
+
+- resolves dependencies recursively
+- installs missing packages
+- skips already-installed package names
+- uses the local index
+
+---
+
+### Removal
+
+```
 box rm <PKG>-<VER>
-  Remove an installed package using its manifest
+```
 
+- removes files via manifest
+- refuses if other packages depend on it
+
+---
+
+### Inspection
+
+```
 box list
-  List installed packages
+box info <PKG>-<VER>
+box own <absolute-path>
+```
 
-box world <file>
-  Install a list of recipes; stops on first failure
+---
 
-box adopt <PKG> <VER> <absolute-path>
-  Retroactively track already-installed files
+### Batch install
 
-------------------------------------------------------------------------------
+```
+box world <file> [--force]
+```
 
-LICENSE
+Installs a list of recipes.
+
+---
+
+### Recipe creation
+
+```
+box new
+```
+
+Interactive recipe generator.
+
+---
+
+## INDEX
+
+Default location:
+
+```
+~/ls-box/index.tsv
+```
+
+Override:
+
+```
+BOX_INDEX=/path/to/index.tsv
+```
+
+Format:
+
+```
+name<TAB>version<TAB>recipe_path<TAB>deps
+```
+
+Example:
+
+```
+zlib    1.3.1  zlib-1.3.1.sh
+openssl 3.5.0  openssl-3.5.0.sh   zlib
+```
+
+Notes:
+
+- deps are space-separated
+- only one version per package (for now)
+- no version solving yet
+
+---
+
+## DEPENDENCY MODEL
+
+- dependencies must be listed in the index
+- install order is resolved recursively
+- already-installed packages satisfy deps by name
+- cycles are detected and rejected
+- removal is blocked by reverse dependencies
+
+---
+
+## COLLISIONS
+
+box refuses to overwrite:
+
+- files owned by another package
+- unowned existing files
+
+Override:
+
+```
+box add ... --force
+box install ... --force
+```
+
+---
+
+## ADOPTION
+
+```
+box adopt <name> <ver> <path>
+```
+
+Tracks existing files into box ownership.
+
+---
+
+## WHAT THIS IS (AND ISN’T)
+
+box **is**:
+
+- deterministic
+- auditable
+- minimal
+- source-based
+
+box is **not yet**:
+
+- a binary package manager
+- a remote repo client
+- a version solver
+- a dependency SAT engine
+
+---
+
+## LICENSE
 
 See LICENSE.

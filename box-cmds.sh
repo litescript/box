@@ -111,6 +111,17 @@ box_record_install() {
   [ -n "${LOG:-}" ] && [ -f "$LOG" ] && cp -f -- "$LOG" "$inst/install.log" || true
 }
 
+box_install() {
+  need_root
+  [ $# -ge 1 ] || die "usage: box install <pkg> [--force]"
+
+  local pkg="$1"
+  local force="no"
+  [ "${2:-}" = "--force" ] && force="yes"
+
+  box_resolve_install "$pkg" "$force"
+}
+
 # --- Dependency helpers (v1) ---
 
 installed_has_pkg() {
@@ -388,6 +399,7 @@ main() {
 
   case "$cmd" in
     init) box_init ;;
+    install) box_install "$@" ;;
     new) box_new ;;
     add) box_add "$@" ;;
     rm) box_rm "$@" ;;

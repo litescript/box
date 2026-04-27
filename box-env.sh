@@ -16,4 +16,5 @@ if [ -n "${SUDO_USER:-}" ]; then
 fi
 USER_HOME="${USER_HOME:-$HOME}"
 
+BOX_INDEX="${BOX_INDEX:-$USER_HOME/ls-box/index.tsv}"
 RECIPE_DIR="${RECIPE_DIR:-$USER_HOME/ls-box/recipes}"
