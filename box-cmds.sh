@@ -404,6 +404,7 @@ main() {
     add) box_add "$@" ;;
     rm) box_rm "$@" ;;
     adopt) box_adopt "$@" ;;
+    deps) box_deps "$@" ;;
     own) box_own "$@" ;;
     list) box_list ;;
     search) box_search "$@" ;;

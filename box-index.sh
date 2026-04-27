@@ -45,6 +45,7 @@ _box_resolve() {
 
   # already installed → skip
   if installed_has_pkg "$pkg"; then
+    echo "box: already installed: $pkg"
     return 0
   fi
 
@@ -80,6 +81,44 @@ _box_resolve() {
   else
     box_add "$recipe"
   fi
+}
+
+box_deps() {
+  [ $# -eq 1 ] || die "usage: box deps <pkg>"
+
+  local pkg="$1"
+
+  declare -gA _box_deps_seen
+  declare -gA _box_deps_stack
+
+  _box_deps_resolve "$pkg"
+}
+
+_box_deps_resolve() {
+  local pkg="$1"
+
+  if [ "${_box_deps_stack[$pkg]:-0}" -eq 1 ]; then
+    die "dependency cycle detected at: $pkg"
+  fi
+
+  if [ "${_box_deps_seen[$pkg]:-0}" -eq 1 ]; then
+    return 0
+  fi
+
+  _box_deps_stack[$pkg]=1
+
+  local deps dep
+  deps="$(index_deps_for "$pkg")"
+
+  for dep in $deps; do
+    [ -n "$dep" ] || continue
+    _box_deps_resolve "$dep"
+  done
+
+  _box_deps_stack[$pkg]=0
+  _box_deps_seen[$pkg]=1
+
+  printf "%s\n" "$pkg"
 }
 
 box_search() {

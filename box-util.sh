@@ -19,6 +19,7 @@ Usage:
   box add <recipe> [--force]
   box install <pkg> [--force]
   box rm <name-ver>
+  box deps <pkg>
   box own <absolute-path>
   box list
   box search <term>
