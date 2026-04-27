@@ -112,13 +112,40 @@ box_record_install() {
 }
 
 box_install() {
-  need_root
-  [ $# -ge 1 ] || die "usage: box install <pkg> [--force]"
-
-  local pkg="$1"
+  local dry_run="no"
   local force="no"
-  [ "${2:-}" = "--force" ] && force="yes"
+  local pkg=""
 
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run|-n)
+        dry_run="yes"
+        shift
+        ;;
+      --force)
+        force="yes"
+        shift
+        ;;
+      -*)
+        die "unknown option for install: $1"
+        ;;
+      *)
+        [ -z "$pkg" ] || die "usage: box install [--dry-run|-n] <pkg> [--force]"
+        pkg="$1"
+        shift
+        ;;
+    esac
+  done
+
+  [ -n "$pkg" ] || die "usage: box install [--dry-run|-n] <pkg> [--force]"
+
+  if [ "$dry_run" = "yes" ]; then
+    echo "box: install plan:"
+    box_deps "$pkg"
+    return 0
+  fi
+
+  need_root
   box_resolve_install "$pkg" "$force"
 }
 

@@ -17,7 +17,7 @@ Usage:
   box init
   box new (creates recipe for package)
   box add <recipe> [--force]
-  box install <pkg> [--force]
+  box install [--dry-run|-n] <pkg> [--force]
   box rm <name-ver>
   box deps <pkg>
   box own <absolute-path>
